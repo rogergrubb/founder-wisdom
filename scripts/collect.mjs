@@ -1,223 +1,175 @@
 /**
- * Transcript Collector — ZERO API KEYS needed
- * Uses @distube/ytsr (scraping) to find channel
- * Uses @distube/ytpl (scraping) for video listing  
- * Uses youtube-transcript for transcript extraction
+ * Transcript Collector — YouTube Data API v3 + youtube-transcript
  */
 
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import ytpl from '@distube/ytpl';
-import ytsr from '@distube/ytsr';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = path.join(__dirname, '..', 'public', 'data', 'transcripts.json');
+const API_KEY = process.env.YOUTUBE_API_KEY;
 const CHANNEL_HANDLE = 'starterstory';
 const MIN_DURATION_SECONDS = 120;
+const YT_API = 'https://www.googleapis.com/youtube/v3';
 
-function formatDuration(seconds) {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  return `${m}:${String(s).padStart(2, '0')}`;
+async function ytGet(endpoint, params) {
+  const url = new URL(`${YT_API}/${endpoint}`);
+  url.searchParams.set('key', API_KEY);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.error) throw new Error(`YT API: ${data.error.message}`);
+  return data;
+}
+
+function parseDuration(iso) {
+  if (!iso) return 0;
+  const m = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (parseInt(m[1] || 0) * 3600) + (parseInt(m[2] || 0) * 60) + parseInt(m[3] || 0);
+}
+
+function formatDuration(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`;
 }
 
 async function fetchTranscript(videoId) {
   try {
     const { YoutubeTranscript } = await import('youtube-transcript');
     const segments = await YoutubeTranscript.fetchTranscript(videoId);
-
-    const fullText = segments
-      .map(s => s.text)
-      .join(' ')
-      .replace(/\[Music\]/gi, '')
-      .replace(/\[Applause\]/gi, '')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    return { success: true, text: fullText, wordCount: fullText.split(/\s+/).length };
-  } catch (err) {
-    return { success: false, text: '', wordCount: 0, error: err.message?.slice(0, 100) || 'Unknown' };
+    const text = segments.map(s => s.text).join(' ')
+      .replace(/\[Music\]/gi, '').replace(/\[Applause\]/gi, '')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
+    return { ok: true, text, words: text.split(/\s+/).length };
+  } catch (e) {
+    return { ok: false, text: '', words: 0, err: e.message?.slice(0, 100) || 'Unknown' };
   }
 }
 
 async function collect() {
   console.log('\n══════════════════════════════════════════════');
   console.log('  FOUNDER WISDOM — Transcript Collector');
-  console.log('  (No API keys needed)');
   console.log('══════════════════════════════════════════════\n');
 
-  // Check cache
+  if (!API_KEY) {
+    console.error('  ERROR: YOUTUBE_API_KEY not set');
+    ensureOutput({ status: 'error', message: 'No API key' });
+    return;
+  }
+
+  // Cache check
   if (fs.existsSync(OUTPUT_PATH)) {
     try {
       const existing = JSON.parse(fs.readFileSync(OUTPUT_PATH, 'utf-8'));
-      const collectedAt = new Date(existing.metadata?.collectedAt || 0);
-      const hoursSince = (Date.now() - collectedAt.getTime()) / (1000 * 60 * 60);
-
-      if (hoursSince < 24 && existing.videos?.length > 5) {
-        console.log(`  Using cached data (${existing.videos.length} videos, collected ${Math.round(hoursSince)}h ago)`);
+      const hours = (Date.now() - new Date(existing.metadata?.collectedAt || 0).getTime()) / 3.6e6;
+      if (hours < 24 && existing.videos?.length > 5) {
+        console.log(`  Cached: ${existing.videos.length} videos (${Math.round(hours)}h ago)`);
         return;
       }
     } catch {}
   }
 
-  // Step 1: Resolve channel handle to channel URL via search
-  console.log('  Step 1/3: Resolving channel @' + CHANNEL_HANDLE + '...');
-  let channelUrl;
-  try {
-    const searchResults = await ytsr(CHANNEL_HANDLE, { limit: 10 });
-    const channelResult = searchResults.items.find(i => 
-      i.type === 'channel' && 
-      (i.name?.toLowerCase().includes('starter story') || i.url?.includes(CHANNEL_HANDLE))
-    );
-    if (channelResult) {
-      channelUrl = channelResult.url;
-      console.log(`  Found: ${channelResult.name} → ${channelUrl}`);
-    } else {
-      // Try first channel result
-      const anyChannel = searchResults.items.find(i => i.type === 'channel');
-      if (anyChannel) {
-        channelUrl = anyChannel.url;
-        console.log(`  Found (best match): ${anyChannel.name} → ${channelUrl}`);
-      } else {
-        throw new Error('No channel found in search results');
+  // Step 1: Find channel
+  console.log('  Step 1/4: Finding channel @' + CHANNEL_HANDLE + '...');
+  const ch = await ytGet('channels', { forHandle: CHANNEL_HANDLE, part: 'snippet,contentDetails' });
+  if (!ch.items?.length) throw new Error('Channel not found');
+  const channel = ch.items[0];
+  const uploadsId = channel.contentDetails.relatedPlaylists.uploads;
+  console.log(`  Channel: ${channel.snippet.title} (${channel.id})`);
+
+  // Step 2: Get all video IDs from uploads playlist
+  console.log('  Step 2/4: Listing videos...');
+  const videoIds = [];
+  let pageToken = '';
+  do {
+    const params = { playlistId: uploadsId, part: 'snippet', maxResults: '50' };
+    if (pageToken) params.pageToken = pageToken;
+    const pl = await ytGet('playlistItems', params);
+    pl.items?.forEach(i => videoIds.push(i.snippet.resourceId.videoId));
+    pageToken = pl.nextPageToken || '';
+    console.log(`  ...${videoIds.length} videos`);
+  } while (pageToken);
+
+  // Step 3: Get video details (duration, views) in batches
+  console.log(`  Step 3/4: Getting details for ${videoIds.length} videos...`);
+  const videoDetails = [];
+  for (let i = 0; i < videoIds.length; i += 50) {
+    const batch = videoIds.slice(i, i + 50);
+    const vd = await ytGet('videos', { id: batch.join(','), part: 'snippet,contentDetails,statistics' });
+    vd.items?.forEach(v => {
+      const dur = parseDuration(v.contentDetails.duration);
+      if (dur >= MIN_DURATION_SECONDS) {
+        videoDetails.push({
+          id: v.id,
+          title: v.snippet.title,
+          description: v.snippet.description?.slice(0, 300) || '',
+          publishedAt: v.snippet.publishedAt,
+          thumbnail: v.snippet.thumbnails?.high?.url || v.snippet.thumbnails?.default?.url || '',
+          durationSeconds: dur,
+          durationFormatted: formatDuration(dur),
+          viewCount: parseInt(v.statistics.viewCount || '0', 10),
+        });
       }
-    }
-  } catch (err) {
-    console.error('  Search failed:', err.message);
-    // Fallback: try direct channel URL formats
-    channelUrl = `https://www.youtube.com/@${CHANNEL_HANDLE}`;
-    console.log(`  Using fallback URL: ${channelUrl}`);
+    });
   }
+  console.log(`  Long-form videos: ${videoDetails.length} (filtered ${videoIds.length - videoDetails.length} shorts)`);
 
-  // Step 2: Get all videos from channel
-  console.log('  Step 2/3: Fetching video list...');
-  let playlist;
-  try {
-    playlist = await ytpl(channelUrl, { limit: Infinity });
-  } catch (err) {
-    console.error('  Failed to fetch channel:', err.message);
-    if (fs.existsSync(OUTPUT_PATH)) {
-      console.log('  Using existing cached data.');
-      return;
-    }
-    fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
-    fs.writeFileSync(OUTPUT_PATH, JSON.stringify({
-      metadata: { collectedAt: new Date().toISOString(), totalVideos: 0, withTranscripts: 0, totalWords: 0, status: 'error', message: err.message },
-      videos: [],
-    }));
-    return;
-  }
-
-  console.log(`  Channel: ${playlist.title}`);
-  console.log(`  Total videos found: ${playlist.items.length}`);
-
-  // Filter to long-form only
-  const longForm = playlist.items.filter(item => {
-    let durationSec = 0;
-    if (typeof item.duration === 'string') {
-      const parts = item.duration.split(':').map(Number);
-      if (parts.length === 3) durationSec = parts[0] * 3600 + parts[1] * 60 + parts[2];
-      else if (parts.length === 2) durationSec = parts[0] * 60 + parts[1];
-    } else if (typeof item.durationSec === 'number') {
-      durationSec = item.durationSec;
-    }
-    item._durationSec = durationSec;
-    return durationSec >= MIN_DURATION_SECONDS;
-  });
-
-  console.log(`  Long-form videos (>${MIN_DURATION_SECONDS}s): ${longForm.length}`);
-  console.log(`  Filtered out ${playlist.items.length - longForm.length} shorts/clips\n`);
-
-  // Step 2: Fetch transcripts
-  console.log('  Step 3/3: Fetching transcripts...');
-  let successCount = 0;
-  let failCount = 0;
-  let totalWords = 0;
+  // Step 4: Fetch transcripts
+  console.log(`\n  Step 4/4: Fetching transcripts...`);
+  let ok = 0, fail = 0, totalWords = 0;
   const videos = [];
 
-  for (let i = 0; i < longForm.length; i++) {
-    const item = longForm[i];
-    const progress = `[${i + 1}/${longForm.length}]`;
-    process.stdout.write(`  ${progress} ${(item.title || '').slice(0, 55)}... `);
-
-    const transcript = await fetchTranscript(item.id);
-
+  for (let i = 0; i < videoDetails.length; i++) {
+    const v = videoDetails[i];
+    process.stdout.write(`  [${i+1}/${videoDetails.length}] ${v.title.slice(0,55)}... `);
+    const t = await fetchTranscript(v.id);
     videos.push({
-      id: item.id,
-      title: item.title,
-      description: '',
-      publishedAt: item.uploadDate || '',
-      thumbnail: item.bestThumbnail?.url || item.thumbnails?.[0]?.url || '',
-      url: item.shortUrl || `https://www.youtube.com/watch?v=${item.id}`,
-      durationSeconds: item._durationSec || 0,
-      durationFormatted: item.duration || formatDuration(item._durationSec || 0),
-      viewCount: parseInt(String(item.views || '0').replace(/[^0-9]/g, ''), 10) || 0,
-      transcriptAvailable: transcript.success,
-      transcript: transcript.text,
-      wordCount: transcript.wordCount,
+      ...v,
+      url: `https://www.youtube.com/watch?v=${v.id}`,
+      transcriptAvailable: t.ok,
+      transcript: t.text,
+      wordCount: t.words,
     });
-
-    if (transcript.success) {
-      successCount++;
-      totalWords += transcript.wordCount;
-      console.log(`✓ (${transcript.wordCount} words)`);
-    } else {
-      failCount++;
-      console.log(`✗ (${transcript.error})`);
-    }
-
-    if (i < longForm.length - 1) {
-      await new Promise(r => setTimeout(r, 300));
-    }
+    if (t.ok) { ok++; totalWords += t.words; console.log(`✓ (${t.words} words)`); }
+    else { fail++; console.log(`✗ (${t.err})`); }
+    if (i < videoDetails.length - 1) await new Promise(r => setTimeout(r, 200));
   }
 
-  const database = {
+  const db = {
     metadata: {
       channelUrl: `https://www.youtube.com/@${CHANNEL_HANDLE}`,
-      channelTitle: playlist.title || 'Starter Story',
+      channelTitle: channel.snippet.title,
       collectedAt: new Date().toISOString(),
-      totalVideos: longForm.length,
-      withTranscripts: successCount,
-      failedTranscripts: failCount,
+      totalVideos: videoDetails.length,
+      withTranscripts: ok,
+      failedTranscripts: fail,
       totalWords,
     },
-    videos: videos.sort((a, b) => {
-      if (a.publishedAt && b.publishedAt) return new Date(b.publishedAt) - new Date(a.publishedAt);
-      return 0;
-    }),
+    videos: videos.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt)),
   };
 
   fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
-  fs.writeFileSync(OUTPUT_PATH, JSON.stringify(database, null, 2));
-
-  const fileSizeMB = (Buffer.byteLength(JSON.stringify(database)) / (1024 * 1024)).toFixed(1);
+  fs.writeFileSync(OUTPUT_PATH, JSON.stringify(db, null, 2));
 
   console.log('\n══════════════════════════════════════════════');
-  console.log('  COLLECTION COMPLETE');
-  console.log('══════════════════════════════════════════════');
-  console.log(`  Videos:      ${longForm.length}`);
-  console.log(`  Transcripts: ${successCount}`);
-  console.log(`  Failed:      ${failCount}`);
-  console.log(`  Total words: ${totalWords.toLocaleString()}`);
-  console.log(`  File size:   ${fileSizeMB} MB`);
+  console.log(`  DONE: ${ok} transcripts | ${totalWords.toLocaleString()} words | ${(Buffer.byteLength(JSON.stringify(db))/1048576).toFixed(1)} MB`);
   console.log('══════════════════════════════════════════════\n');
+}
+
+function ensureOutput(meta) {
+  fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
+  if (!fs.existsSync(OUTPUT_PATH)) {
+    fs.writeFileSync(OUTPUT_PATH, JSON.stringify({
+      metadata: { collectedAt: new Date().toISOString(), totalVideos: 0, withTranscripts: 0, totalWords: 0, ...meta },
+      videos: [],
+    }));
+  }
 }
 
 collect().catch(err => {
   console.error('Collection failed:', err.message);
-  if (!fs.existsSync(OUTPUT_PATH)) {
-    fs.mkdirSync(path.dirname(OUTPUT_PATH), { recursive: true });
-    fs.writeFileSync(OUTPUT_PATH, JSON.stringify({
-      metadata: { collectedAt: new Date().toISOString(), totalVideos: 0, withTranscripts: 0, totalWords: 0, status: 'error', message: err.message },
-      videos: [],
-    }));
-  }
+  ensureOutput({ status: 'error', message: err.message });
 });
