@@ -1,6 +1,7 @@
 /**
  * Transcript Collector — ZERO API KEYS needed
- * Uses @distube/ytpl (scraping) for video listing
+ * Uses @distube/ytsr (scraping) to find channel
+ * Uses @distube/ytpl (scraping) for video listing  
  * Uses youtube-transcript for transcript extraction
  */
 
@@ -8,10 +9,11 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ytpl from '@distube/ytpl';
+import ytsr from '@distube/ytsr';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT_PATH = path.join(__dirname, '..', 'public', 'data', 'transcripts.json');
-const CHANNEL_URL = 'https://www.youtube.com/@starterstory';
+const CHANNEL_HANDLE = 'starterstory';
 const MIN_DURATION_SECONDS = 120;
 
 function formatDuration(seconds) {
@@ -66,11 +68,40 @@ async function collect() {
     } catch {}
   }
 
-  // Step 1: Get all videos from channel
-  console.log('  Step 1/2: Fetching channel video list...');
+  // Step 1: Resolve channel handle to channel URL via search
+  console.log('  Step 1/3: Resolving channel @' + CHANNEL_HANDLE + '...');
+  let channelUrl;
+  try {
+    const searchResults = await ytsr(CHANNEL_HANDLE, { limit: 10 });
+    const channelResult = searchResults.items.find(i => 
+      i.type === 'channel' && 
+      (i.name?.toLowerCase().includes('starter story') || i.url?.includes(CHANNEL_HANDLE))
+    );
+    if (channelResult) {
+      channelUrl = channelResult.url;
+      console.log(`  Found: ${channelResult.name} → ${channelUrl}`);
+    } else {
+      // Try first channel result
+      const anyChannel = searchResults.items.find(i => i.type === 'channel');
+      if (anyChannel) {
+        channelUrl = anyChannel.url;
+        console.log(`  Found (best match): ${anyChannel.name} → ${channelUrl}`);
+      } else {
+        throw new Error('No channel found in search results');
+      }
+    }
+  } catch (err) {
+    console.error('  Search failed:', err.message);
+    // Fallback: try direct channel URL formats
+    channelUrl = `https://www.youtube.com/@${CHANNEL_HANDLE}`;
+    console.log(`  Using fallback URL: ${channelUrl}`);
+  }
+
+  // Step 2: Get all videos from channel
+  console.log('  Step 2/3: Fetching video list...');
   let playlist;
   try {
-    playlist = await ytpl(CHANNEL_URL, { limit: Infinity });
+    playlist = await ytpl(channelUrl, { limit: Infinity });
   } catch (err) {
     console.error('  Failed to fetch channel:', err.message);
     if (fs.existsSync(OUTPUT_PATH)) {
@@ -106,7 +137,7 @@ async function collect() {
   console.log(`  Filtered out ${playlist.items.length - longForm.length} shorts/clips\n`);
 
   // Step 2: Fetch transcripts
-  console.log('  Step 2/2: Fetching transcripts...');
+  console.log('  Step 3/3: Fetching transcripts...');
   let successCount = 0;
   let failCount = 0;
   let totalWords = 0;
@@ -150,7 +181,7 @@ async function collect() {
 
   const database = {
     metadata: {
-      channelUrl: CHANNEL_URL,
+      channelUrl: `https://www.youtube.com/@${CHANNEL_HANDLE}`,
       channelTitle: playlist.title || 'Starter Story',
       collectedAt: new Date().toISOString(),
       totalVideos: longForm.length,
