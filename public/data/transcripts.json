@@ -1,0 +1,13 @@
+{
+  "metadata": {
+    "channelUrl": "https://www.youtube.com/@starterstory/videos",
+    "channelTitle": "Starter Story",
+    "collectedAt": "2026-02-12T00:00:00Z",
+    "totalVideos": 0,
+    "withTranscripts": 0,
+    "totalWords": 0,
+    "status": "pending",
+    "message": "Set YOUTUBE_API_KEY env var in Vercel and redeploy to collect transcripts."
+  },
+  "videos": []
+}
